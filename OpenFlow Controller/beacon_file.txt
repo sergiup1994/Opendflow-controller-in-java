@@ -1,0 +1,149 @@
+package net.beaconcontroller.tutorial;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+import net.beaconcontroller.core.IBeaconProvider;
+import net.beaconcontroller.core.IOFMessageListener;
+import net.beaconcontroller.core.IOFSwitch;
+import net.beaconcontroller.core.IOFSwitchListener;
+import net.beaconcontroller.packet.Ethernet;
+
+import org.openflow.protocol.OFFlowMod;
+import org.openflow.protocol.OFMatch;
+import org.openflow.protocol.OFMessage;
+import org.openflow.protocol.OFPacketIn;
+import org.openflow.protocol.OFPacketOut;
+import org.openflow.protocol.OFPort;
+import org.openflow.protocol.OFType;
+import org.openflow.protocol.action.OFAction;
+import org.openflow.protocol.action.OFActionOutput;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+public class LearningSwitchTutorial implements IOFMessageListener, IOFSwitchListener {
+    protected static Logger log = LoggerFactory.getLogger(LearningSwitchTutorial.class);
+    protected IBeaconProvider beaconProvider;
+    protected Map<IOFSwitch, Map<Long,Short>> macTables =
+        new HashMap<IOFSwitch, Map<Long,Short>>();
+
+    public Command receive(IOFSwitch sw, OFMessage msg) throws IOException {
+        initMACTable(sw);
+        OFPacketIn pi = (OFPacketIn) msg;
+
+     
+        //forwardAsHub(sw, pi);
+
+    
+        forwardAsLearningSwitch(sw, pi);
+        return Command.CONTINUE;
+    }
+
+ 
+    public void forwardAsHub(IOFSwitch sw, OFPacketIn pi) throws IOException {
+        // make an OpenFlow object
+        OFPacketOut po = new OFPacketOut();
+
+        // use the packet to flood the network
+        OFAction action = new OFActionOutput(OFPort.OFPP_FLOOD.getValue());
+        po.setActions(Collections.singletonList(action));
+
+        // set the port on which the packet arrived on
+        po.setInPort(pi.getInPort());
+
+        // Reference the packet buffered 
+        po.setBufferId(pi.getBufferId());
+        if (pi.getBufferId() == OFPacketOut.BUFFER_ID_NONE) {
+         
+            //if the packet is not buffered at the switch it data from ofpacket must be copied to the new ofpacketout message
+            po.setPacketData(pi.getPacketData());
+        }
+        // Send the OFPacketOut to the switch
+        sw.getOutputStream().write(po);
+    }
+
+   
+    public void forwardAsLearningSwitch(IOFSwitch sw, OFPacketIn pi) throws IOException {
+        Map<Long,Short> macTable = macTables.get(sw);
+
+        // Build Match
+        OFMatch match = OFMatch.load(pi.getPacketData(), pi.getInPort());
+
+        // learn the port 
+        macTable.put(Ethernet.toLong(match.getDataLayerSource()), pi.getInPort());
+
+        //retrieve the previous port which has been learned
+        Short outPort = macTable.get(Ethernet.toLong(match.getDataLayerDestination()));
+
+        if (outPort != null) {
+            // if the destination is unknow  have a flowmod
+            OFFlowMod fm = new OFFlowMod();
+            fm.setBufferId(pi.getBufferId());
+            fm.setCommand(OFFlowMod.OFPFC_ADD);
+            // time the flow
+            fm.setIdleTimeout((short) 5);
+            // match the packets with created matches
+            fm.setMatch(match);
+            // Send matching packets to outPort
+            OFAction action = new OFActionOutput(outPort);
+            fm.setActions(Collections.singletonList((OFAction)action));
+            // Send this OFFlowMod to the switch
+            sw.getOutputStream().write(fm);
+
+            if (pi.getBufferId() == OFPacketOut.BUFFER_ID_NONE) {
+             
+                //if the packet was not buffered at the switch it must be sent as an ofpacketout after the offlowmod
+                OFPacketOut po = new OFPacketOut();
+                action = new OFActionOutput(outPort);
+                po.setActions(Collections.singletonList(action));
+                po.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+                po.setInPort(pi.getInPort());
+                po.setPacketData(pi.getPacketData());
+                sw.getOutputStream().write(po);
+            }
+        } else {
+            // if the destination is not known behave as a hub
+            forwardAsHub(sw, pi);
+        }
+    }
+    
+    private void initMACTable(IOFSwitch sw) {
+        Map<Long,Short> macTable = macTables.get(sw);
+        if (macTable == null) {
+            macTable = new HashMap<Long,Short>();
+            macTables.put(sw, macTable);
+        }
+    }
+
+    @Override
+    public void addedSwitch(IOFSwitch sw) {
+    }
+
+    @Override
+    public void removedSwitch(IOFSwitch sw) {
+        macTables.remove(sw);
+    }
+
+    public void setBeaconProvider(IBeaconProvider beaconProvider) {
+        this.beaconProvider = beaconProvider;
+    }
+
+    public void startUp() {
+        log.trace("Starting");
+        beaconProvider.addOFMessageListener(OFType.PACKET_IN, this);
+        beaconProvider.addOFSwitchListener(this);
+    }
+
+    public void shutDown() {
+        log.trace("Stopping");
+        beaconProvider.removeOFMessageListener(OFType.PACKET_IN, this);
+        beaconProvider.removeOFSwitchListener(this);
+    }
+
+    public String getName() {
+        return "tutorial";
+    }
+}
